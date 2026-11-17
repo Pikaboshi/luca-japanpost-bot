@@ -1,0 +1,8 @@
+# トークンと状態ファイルは絶対に共有しない
+token.txt
+.luca_token.txt
+tracking_state.json
+tracking_state.json.bak
+tracking_state.json.broken
+__pycache__/
+.venv/
