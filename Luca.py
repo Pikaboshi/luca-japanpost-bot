@@ -1,6 +1,21 @@
 """
 日本郵便 追跡 -> Discord通知 Bot「Luca」 v4（複数件・複数人対応）
 
+v4.27 の変更点（外部レビュー第3ラウンド: v4.26 の OCR 周り）:
+  - 候補の元を、全パス結合テキストではなく候補ごとの集計
+    （counts）のキーにした。結合は「1回の読み取りの中で、行単位で
+    候補が無かった時だけ、その1回ぶんを結合して探す」形にし、
+    パスをまたいだ結合で偽候補が構造的に出ないようにした
+    （v4.26 の「一致0回なら外す」フィルタは、集計と候補の集合が
+    実質同じで効いていなかったための作り直し）
+  - /scan の待機に上限（120秒）を付け、取れなければ「混み合って
+    います」と返すようにした。同じ人が実行中・待機中に重ねて
+    実行することも弾くようにし、待機通知は読み取り開始時に
+    削除するようにした（通知の送信失敗でスキャンが止まらない
+    よう、通知まわりは例外を握る形にした）
+  - OCR の所要時間と、締切で打ち切ったかどうかをコンソールへ
+    出すようにした（締切300秒の妥当性を実測で判断するため）
+
 v4.26 の変更点（外部レビュー第2ラウンド: v4.25 の OCR 周り）:
   - 候補ゼロ時の読み取り順を入れ替え、左右反転の読み取りを
     「通常パスでの回転リトライ」より先に回すようにした
@@ -356,6 +371,7 @@ PENDING_MAX_TOTAL = 100  # 保留候補の全体上限（再照会の負荷対�
 PENDING_MAX_PER_USER = 20  # 保留候補の1人あたり上限
 OCR_CALL_TIMEOUT = 20  # Tesseract 1回の呼び出しのタイムアウト（秒）
 OCR_DEADLINE_SECONDS = 300  # /scan の OCR 全体の締切（秒）
+OCR_WAIT_TIMEOUT_SECONDS = 120  # /scan の OCR 待機の上限（秒）
 STALL_SECONDS = 48 * 3600  # この時間ステータスが動かなければ停滞アラート
 HISTORY_MAX = 100  # 配達済み履歴の保持件数
 
@@ -815,6 +831,8 @@ _check_lock = asyncio.Lock()
 # /scan の OCR は重い（最悪で数分）ため、同時に1件だけ実行する。
 # クールダウン30秒だけでは処理時間より短く、重ねて実行できてしまうため。
 _scan_semaphore = asyncio.Semaphore(1)
+# /scan を実行中・待機中のユーザーID（同じ人が待ち行列を埋めないため）
+_scan_active_users: set[int] = set()
 
 
 async def check_entry(number: str, entry: dict) -> str:
@@ -1568,9 +1586,10 @@ _last_ocr_detail: dict | None = None
 def _record_ocr_text(txt: str) -> None:
     """Tesseract 1回ぶんの結果から候補を数える（信頼度の集計用）。
 
-    集計は行単位だけで行う（全体を結合して探す保険は使わない）。
-    数字の断片同士がくっついてできた候補を「1回は現れた候補」と
-    数えてしまうと、パス境界またぎの偽候補を見分けられないため。
+    まず行単位で探す。1回の中で行単位の候補が1件も無かった時だけ、
+    その1回ぶんのテキストを結合して探す（番号の途中で改行が入った
+    読み取りへの保険）。結合は1回の中で閉じるため、パスをまたいだ
+    断片同士がくっついた偽候補は数えられない。
     """
     if not getattr(_ocr_ctx, "active", False):
         return
@@ -1579,6 +1598,8 @@ def _record_ocr_text(txt: str) -> None:
     normalized = txt.translate(_FULLWIDTH_TABLE)
     for line in normalized.splitlines():
         _scan_numbers(line, strong, weak)
+    if not strong:
+        _scan_numbers(normalized, strong, weak)
     for candidate in strong:
         _ocr_ctx.counts[candidate] = _ocr_ctx.counts.get(candidate, 0) + 1
         _ocr_ctx.sources.setdefault(candidate, set()).add(_ocr_ctx.stage)
@@ -1611,6 +1632,7 @@ def _ocr_pass_texts(image, target_width: int, extended: bool) -> str:
     for img, config in passes:
         deadline = getattr(_ocr_ctx, "deadline", None)
         if deadline is not None and time.monotonic() > deadline:
+            _ocr_ctx.cut = True
             break
         try:
             txt = pytesseract.image_to_string(
@@ -1691,9 +1713,12 @@ def ocr_image(data: bytes) -> str:
     _ocr_ctx.sources = {}
     _ocr_ctx.stage = "initial"
     _ocr_ctx.deadline = time.monotonic() + OCR_DEADLINE_SECONDS
+    _ocr_ctx.cut = False
+    _ocr_started = time.monotonic()
 
     def run(img, target_width: int, extended: bool, stage: str) -> str:
         if time.monotonic() > _ocr_ctx.deadline:
+            _ocr_ctx.cut = True
             return ""
         _ocr_ctx.stage = stage
         return _ocr_pass_texts(img, target_width, extended)
@@ -1745,6 +1770,12 @@ def ocr_image(data: bytes) -> str:
         }
         _ocr_ctx.active = False
         _ocr_ctx.deadline = None
+        # 締切（300秒）の妥当性を実測で判断するための記録
+        print(
+            f"OCR所要時間: {time.monotonic() - _ocr_started:.1f}秒"
+            f" / 候補 {len(_ocr_ctx.counts)} 件"
+            + (" / 締切で打ち切り" if getattr(_ocr_ctx, "cut", False) else "")
+        )
 
 
 @tree.command(name="history", description="自分の配達済み履歴を確認")
@@ -1839,21 +1870,58 @@ async def scan_command(
     # 同時に1件だけ実行する（Tesseractの並列実行を防ぐ）。
     # 信頼度の集計（_last_ocr_detail）もこの区間の中で受け取る。
     global _last_ocr_detail
-    if _scan_semaphore.locked():
-        # 前の人の OCR が終わるまで待つことがあるため、先に一言返す
+    if interaction.user.id in _scan_active_users:
         await interaction.followup.send(
-            "前の写真を読み取り中です。終わり次第、あなたの写真を読み取ります。",
+            "あなたの写真は既に読み取り中（または待機中）です。"
+            "終わるまでお待ちください。",
             ephemeral=True,
         )
-    try:
-        async with _scan_semaphore:
-            _last_ocr_detail = None
-            data = await image.read()
-            text = await asyncio.to_thread(ocr_image, data)
-            ocr_detail = _last_ocr_detail
-    except RuntimeError as e:
-        await interaction.followup.send(str(e), ephemeral=True)
         return
+    _scan_active_users.add(interaction.user.id)
+    try:
+        wait_msg = None
+        if _scan_semaphore.locked():
+            # 前の人の OCR が終わるまで待つことがあるため、先に一言返す。
+            # 通知の失敗でスキャン自体は止めない
+            try:
+                wait_msg = await interaction.followup.send(
+                    "前の写真を読み取り中です。"
+                    "終わり次第、あなたの写真を読み取ります。",
+                    ephemeral=True,
+                )
+            except Exception:
+                wait_msg = None
+        try:
+            await asyncio.wait_for(
+                _scan_semaphore.acquire(),
+                timeout=OCR_WAIT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            await interaction.followup.send(
+                "現在 /scan が混み合っています。"
+                "少し時間をおいてから試してください。",
+                ephemeral=True,
+            )
+            return
+        try:
+            if wait_msg is not None:
+                # 待機通知は役割を終えたので消す（古い表示を残さない）
+                try:
+                    await wait_msg.delete()
+                except Exception:
+                    pass
+            _last_ocr_detail = None
+            try:
+                data = await image.read()
+                text = await asyncio.to_thread(ocr_image, data)
+            except RuntimeError as e:
+                # OCR由来の RuntimeError は利用者向けの文面なのでそのまま出す
+                # （それ以外の RuntimeError は下の汎用文面に倒す）
+                await interaction.followup.send(str(e), ephemeral=True)
+                return
+            ocr_detail = _last_ocr_detail
+        finally:
+            _scan_semaphore.release()
     except Exception as e:
         # 例外の詳細（パス等）は利用者へ出さず、コンソールにだけ残す
         print(f"/scan の処理エラー: {e!r}")
@@ -1862,20 +1930,22 @@ async def scan_command(
             ephemeral=True,
         )
         return
+    finally:
+        _scan_active_users.discard(interaction.user.id)
 
-    candidates, weak = _extract_all(text)
+    _, weak = _extract_all(text)
     if ocr_detail is not None:
+        # 候補の元は集計（counts）のキーにする。全パスをつないだ
+        # テキストから候補を作ると、パスをまたいだ断片同士が
+        # くっついた偽候補が混ざるため（集計は1回の読み取りの中で
+        # 閉じているので、構造的に混ざらない）。
         # 候補ごとに信頼度を付ける: 通常パスで出た候補か、2回以上の
         # 読み取りで一致した候補だけを「信頼できる候補」とする。
         # 一致回数の多い順に並べ替え、正解が照会上限の外へ
         # 押し出されにくくする。
         counts = ocr_detail.get("counts", {})
         initial = ocr_detail.get("initial", set())
-        if counts:
-            # どの1回の読み取りにも現れなかった候補は、全パスを
-            # つないだテキストから作られた境界またぎの候補なので、
-            # 照会・保留・提示の対象から外す
-            candidates = [c for c in candidates if counts.get(c, 0) >= 1]
+        candidates = list(counts.keys())
         order = {c: i for i, c in enumerate(candidates)}
         # 一致回数で並べる。通常パスで出た候補は +1 ぶん重みを付ける
         candidates.sort(
@@ -1889,7 +1959,9 @@ async def scan_command(
         }
     else:
         # ocr_image が差し替えられている場合など、集計が無いときは
-        # 従来どおり全候補を信頼できるものとして扱う
+        # 従来どおり結合テキストから候補を作り、全候補を信頼できる
+        # ものとして扱う
+        candidates, weak = _extract_all(text)
         trusted = set(candidates)
 
     def pending_of(numbers: list[str]) -> list[str]:
