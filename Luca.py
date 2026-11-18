@@ -1,6 +1,18 @@
 """
 日本郵便 追跡 -> Discord通知 Bot「Luca」 v4（複数件・複数人対応）
 
+v4.26 の変更点（外部レビュー第2ラウンド: v4.25 の OCR 周り）:
+  - 候補ゼロ時の読み取り順を入れ替え、左右反転の読み取りを
+    「通常パスでの回転リトライ」より先に回すようにした
+    （締切で打ち切られた場合に、反転写真だけが拾えなくなる
+    並びを避けるため。リトライは既に試した向きの保険なので最後）
+  - 候補の集計を行単位だけにし、全パスをつないだテキストから
+    作られた候補（どの1回の読み取りにも現れなかった、パス境界
+    またぎの候補）は、候補一覧から外すようにした
+    （日本郵便への照会枠を偽の候補に使わないため）
+  - /scan の OCR が実行中のときに次の人が実行したら、待機中
+    である旨を先に返すようにした（最大で締切ぶん待つため）
+
 v4.25 の変更点（外部レビュー: v4.23/v4.24 の OCR 周り）:
   - OCR の候補ごとに「何回の読み取りで一致したか」と「通常パスで
     出たか」を数えるようにし、信頼できる候補だけで保留プールへ
@@ -1554,10 +1566,19 @@ _last_ocr_detail: dict | None = None
 
 
 def _record_ocr_text(txt: str) -> None:
-    """Tesseract 1回ぶんの結果から候補を数える（信頼度の集計用）。"""
+    """Tesseract 1回ぶんの結果から候補を数える（信頼度の集計用）。
+
+    集計は行単位だけで行う（全体を結合して探す保険は使わない）。
+    数字の断片同士がくっついてできた候補を「1回は現れた候補」と
+    数えてしまうと、パス境界またぎの偽候補を見分けられないため。
+    """
     if not getattr(_ocr_ctx, "active", False):
         return
-    strong, _ = _extract_all(txt)
+    strong: list[str] = []
+    weak: list[str] = []
+    normalized = txt.translate(_FULLWIDTH_TABLE)
+    for line in normalized.splitlines():
+        _scan_numbers(line, strong, weak)
     for candidate in strong:
         _ocr_ctx.counts[candidate] = _ocr_ctx.counts.get(candidate, 0) + 1
         _ocr_ctx.sources.setdefault(candidate, set()).add(_ocr_ctx.stage)
@@ -1699,18 +1720,20 @@ def ocr_image(data: bytes) -> str:
         for angle in (180, -90, 90):
             rotated = image.rotate(angle, expand=True)
             text += "\n" + run(rotated, 2400, True, "extra")
+        # 鏡越し・反転保存された写真への対応（左右反転して読み直す）。
+        # 向きの網羅が先、保険のリトライは後（締切で打ち切られても、
+        # 反転写真だけが拾えなくなる並びにしないため）
+        mirrored = ImageOps.mirror(image)
+        text += "\n" + run(mirrored, 2400, True, "extra")
+        for angle in (180, -90, 90):
+            rotated = mirrored.rotate(angle, expand=True)
+            text += "\n" + run(rotated, 2400, True, "extra")
         # 写真によっては読み取りが境界線上にあり、同じ条件でも読めたり
         # 読めなかったりする。前処理の違う通常パスでもう一度回転読み取りを
         # して、拾える確率を上げる。
         for angle in (180, -90, 90):
             rotated = image.rotate(angle, expand=True)
             text += "\n" + run(rotated, 1200, False, "extra")
-        # 鏡越し・反転保存された写真への対応（左右反転して読み直す）
-        mirrored = ImageOps.mirror(image)
-        text += "\n" + run(mirrored, 2400, True, "extra")
-        for angle in (180, -90, 90):
-            rotated = mirrored.rotate(angle, expand=True)
-            text += "\n" + run(rotated, 2400, True, "extra")
         return text
     finally:
         _last_ocr_detail = {
@@ -1816,6 +1839,12 @@ async def scan_command(
     # 同時に1件だけ実行する（Tesseractの並列実行を防ぐ）。
     # 信頼度の集計（_last_ocr_detail）もこの区間の中で受け取る。
     global _last_ocr_detail
+    if _scan_semaphore.locked():
+        # 前の人の OCR が終わるまで待つことがあるため、先に一言返す
+        await interaction.followup.send(
+            "前の写真を読み取り中です。終わり次第、あなたの写真を読み取ります。",
+            ephemeral=True,
+        )
     try:
         async with _scan_semaphore:
             _last_ocr_detail = None
@@ -1842,6 +1871,11 @@ async def scan_command(
         # 押し出されにくくする。
         counts = ocr_detail.get("counts", {})
         initial = ocr_detail.get("initial", set())
+        if counts:
+            # どの1回の読み取りにも現れなかった候補は、全パスを
+            # つないだテキストから作られた境界またぎの候補なので、
+            # 照会・保留・提示の対象から外す
+            candidates = [c for c in candidates if counts.get(c, 0) >= 1]
         order = {c: i for i, c in enumerate(candidates)}
         # 一致回数で並べる。通常パスで出た候補は +1 ぶん重みを付ける
         candidates.sort(
