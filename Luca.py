@@ -1,6 +1,15 @@
 """
 日本郵便 追跡 -> Discord通知 Bot「Luca」 v4（複数件・複数人対応）
 
+v4.23 の変更点（実地テスト: 回転した写真で読めない問題への対応）:
+  - /scan の OCR に追加読み取りを入れた。追加パス（大津二値化・
+    psm 11 の数字ホワイトリスト、拡大幅2400px）と、画像を180度・
+    ±90度回転させた読み取りを組み合わせて候補を集める
+    （逆さま・横向きに撮られた写真や、暖色照明の写真でも拾えるように）
+  - 候補が見つかった場合も、誤読だけが残らないよう実績のある2方向の
+    追加読み取りを混ぜて返す（正しい候補は日本郵便の履歴照合で選ばれる）
+  - 前処理の拡大目標幅を引数化した（通常パスは従来通り1200px）
+
 v4.22 の変更点（外部レビューの追加ラウンド）:
   - send_notification が成功時に True を返すよう修正（v4.21 で
     maybe_stall_alert が戻り値に依存するようになったのに、本体は
@@ -1439,7 +1448,7 @@ def extract_tracking_numbers(text: str) -> list[str]:
     return strong
 
 
-def _ocr_variants(image):
+def _ocr_variants(image, target_width: int = 1200):
     """OCRの前処理バリエーション（グレースケール拡大・二値化）を作る。"""
     from PIL import Image, ImageOps
 
@@ -1454,8 +1463,8 @@ def _ocr_variants(image):
         # 膨らみすぎて、メモリを圧迫しないように）
         base = base.resize((max(1, round(w * 2000 / h)), 2000), Image.LANCZOS)
         w, h = base.size
-    # 小さい写真は文字が潰れて読めないので、幅1200pxを目安に拡大する
-    scale = max(1.0, min(6.0, 1200 / max(w, 1)))
+    # 小さい写真は文字が潰れて読めないので、幅 target_width pxを目安に拡大する
+    scale = max(1.0, min(6.0, target_width / max(w, 1)))
     if scale > 1.0:
         base = base.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
         w, h = base.size
@@ -1468,11 +1477,74 @@ def _ocr_variants(image):
     return gray, binary
 
 
+def _otsu_binary(gray):
+    """グレースケール画像を大津の方法で求めた閾値で二値化する。
+
+    暖色照明など、固定閾値（150）では文字が潰れる写真への保険。
+    """
+    hist = gray.histogram()
+    total = sum(hist)
+    if total == 0:
+        return gray.point(lambda p: 255 if p > 150 else 0)
+    sum_all = sum(i * v for i, v in enumerate(hist))
+    sum_b = 0
+    w_b = 0
+    max_var = -1.0
+    threshold = 150
+    for i, v in enumerate(hist):
+        w_b += v
+        if w_b == 0:
+            continue
+        w_f = total - w_b
+        if w_f == 0:
+            break
+        sum_b += i * v
+        m_b = sum_b / w_b
+        m_f = (sum_all - sum_b) / w_f
+        var = w_b * w_f * (m_b - m_f) ** 2
+        if var > max_var:
+            max_var = var
+            threshold = i
+    return gray.point(lambda p: 255 if p > threshold else 0)
+
+
+def _ocr_pass_texts(image, target_width: int, extended: bool) -> str:
+    """前処理した画像に複数のモードでOCRをかけ、結果をまとめて返す。
+
+    1モードでも読めれば番号を拾えるようにするための束ね読み。
+    extended=True では、大津二値化と psm 11 の数字ホワイトリストも加える。
+    """
+    import pytesseract
+
+    gray, binary = _ocr_variants(image, target_width)
+    passes = [
+        (binary, "--psm 6"),
+        (binary, "--psm 11"),
+        (gray, "--psm 6 -c tessedit_char_whitelist=0123456789-"),
+    ]
+    if extended:
+        otsu = _otsu_binary(gray)
+        passes += [
+            (otsu, "--psm 6"),
+            (otsu, "--psm 11"),
+            (gray, "--psm 11 -c tessedit_char_whitelist=0123456789-"),
+        ]
+    texts: list[str] = []
+    for img, config in passes:
+        try:
+            texts.append(pytesseract.image_to_string(img, lang="eng", config=config))
+        except Exception:
+            continue
+    return "\n".join(texts)
+
+
 def ocr_image(data: bytes) -> str:
     """画像バイト列をOCRする。pytesseract / Pillow が無い場合は RuntimeError。
 
     前処理した画像を複数のモードで読み、結果をまとめて返す。
     1モードでも読めれば番号を拾えるようにするため。
+    通常の読み取りで候補が見つからない場合は、追加パスと回転も試す
+    （逆さま・横向きに撮られた写真への対応。見つかった時点で打ち切る）。
     """
     try:
         import pytesseract
@@ -1499,18 +1571,31 @@ def ocr_image(data: bytes) -> str:
         return ""
     # スマホ写真の EXIF 回転情報を反映する（横向きのまま読まないように）
     image = ImageOps.exif_transpose(opened)
-    gray, binary = _ocr_variants(image)
-    texts: list[str] = []
-    for img, config in (
-        (binary, "--psm 6"),
-        (binary, "--psm 11"),
-        (gray, "--psm 6 -c tessedit_char_whitelist=0123456789-"),
-    ):
-        try:
-            texts.append(pytesseract.image_to_string(img, lang="eng", config=config))
-        except Exception:
-            continue
-    return "\n".join(texts)
+    text = _ocr_pass_texts(image, 1200, extended=False)
+    if extract_tracking_numbers(text):
+        # 候補が見つかっても、写真が斜め・逆光などで数字が化けていると
+        # 誤読の候補だけが残ることがある。同じ向きの追加パスと、
+        # 実績のある2方向（180度と時計回り90度）の追加読み取りも
+        # 混ぜて返し、呼び出し側の日本郵便の履歴照合で正しい候補を
+        # 選べるようにする。
+        text += "\n" + _ocr_pass_texts(image, 2400, extended=True)
+        for angle in (180, -90):
+            rotated = image.rotate(angle, expand=True)
+            text += "\n" + _ocr_pass_texts(rotated, 2400, extended=True)
+        return text
+    # 通常の読み取りで候補が見つからなかった場合の追加読み取り。
+    # まず同じ向きのまま追加パス（大津二値化・psm 11・拡大幅2400px）を、
+    # それでも駄目なら180度・±90度に回した読み取りを試す。
+    # EXIF に回転情報が無い（共有・転送で消えた）写真でも拾えるように。
+    text += "\n" + _ocr_pass_texts(image, 2400, extended=True)
+    if extract_tracking_numbers(text):
+        return text
+    for angle in (180, -90, 90):
+        rotated = image.rotate(angle, expand=True)
+        text += "\n" + _ocr_pass_texts(rotated, 2400, extended=True)
+        if extract_tracking_numbers(text):
+            break
+    return text
 
 
 @tree.command(name="history", description="自分の配達済み履歴を確認")
