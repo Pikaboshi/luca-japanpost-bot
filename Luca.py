@@ -1,6 +1,28 @@
 """
 日本郵便 追跡 -> Discord通知 Bot「Luca」 v4（複数件・複数人対応）
 
+v4.25 の変更点（外部レビュー: v4.23/v4.24 の OCR 周り）:
+  - OCR の候補ごとに「何回の読み取りで一致したか」と「通常パスで
+    出たか」を数えるようにし、信頼できる候補だけで保留プールへ
+    入れるようにした（通常パスで出た候補か、2回以上一致した候補
+    だけが保留対象。1回だけの候補は即時照会とボタン提示のみで、
+    保留には入れない。ノイズ候補で保留枠が埋まり、実在する他人の
+    番号が保留経由で自動登録される経路を狭めるため）
+  - 候補の並びを一致回数の多い順にした（正解が照会上限5件の
+    外へ押し出されにくくするため）
+  - なお「履歴が確認できた候補の自動登録」は従来どおり維持した。
+    実地の正解（斜め・暖色の写真）でも一致が1回だけのことが
+    確認できたためで、実在確認そのものを信頼の根拠とする
+  - Tesseract の各呼び出しにタイムアウト（20秒）と、OCR全体の
+    締切（300秒）を付け、/scan の OCR は同時に1件だけ実行する
+    ようにした（処理が数分かかる間に同じ人が重ねて実行して、
+    Tesseract が並列で走るのを防ぐため）
+  - 回転・反転の前に画像を最大2000pxへ縮小するようにした
+    （元解像度のコピーが重なってメモリを圧迫しないように）
+  - Tesseract 本体が無い環境では、全パス空振りしてから
+    「読み取れませんでした」になるのではなく、最初に1回だけ
+    確認してインストール案内を出すようにした
+
 v4.24 の変更点（実地テスト: 反転した写真への対応）:
   - /scan の OCR で、通常の読み取りで候補が見つからない場合に、
     左右反転した画像での読み取りも試すようにした
@@ -194,6 +216,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import unicodedata
@@ -319,6 +342,8 @@ PENDING_TTL = 48 * 3600  # /scan の保留候補を保持する期間（秒）
 MAX_SCAN_CANDIDATES = 10  # 1回の /scan で扱う候補の上限（照会・保留の対象）
 PENDING_MAX_TOTAL = 100  # 保留候補の全体上限（再照会の負荷対策）
 PENDING_MAX_PER_USER = 20  # 保留候補の1人あたり上限
+OCR_CALL_TIMEOUT = 20  # Tesseract 1回の呼び出しのタイムアウト（秒）
+OCR_DEADLINE_SECONDS = 300  # /scan の OCR 全体の締切（秒）
 STALL_SECONDS = 48 * 3600  # この時間ステータスが動かなければ停滞アラート
 HISTORY_MAX = 100  # 配達済み履歴の保持件数
 
@@ -775,6 +800,9 @@ async def send_notification(
 
 
 _check_lock = asyncio.Lock()
+# /scan の OCR は重い（最悪で数分）ため、同時に1件だけ実行する。
+# クールダウン30秒だけでは処理時間より短く、重ねて実行できてしまうため。
+_scan_semaphore = asyncio.Semaphore(1)
 
 
 async def check_entry(number: str, entry: dict) -> str:
@@ -1517,11 +1545,31 @@ def _otsu_binary(gray):
     return gray.point(lambda p: 255 if p > threshold else 0)
 
 
+# OCR 実行中の作業領域（スレッドローカル）。ocr_image が立て、
+# _ocr_pass_texts が候補ごとの一致回数と出どころ（通常パスか）を記録する。
+# scan_command は OCR 完了後に _last_ocr_detail で結果を受け取る
+# （/scan の OCR はセマフォで直列化されているため、競合しない）。
+_ocr_ctx = threading.local()
+_last_ocr_detail: dict | None = None
+
+
+def _record_ocr_text(txt: str) -> None:
+    """Tesseract 1回ぶんの結果から候補を数える（信頼度の集計用）。"""
+    if not getattr(_ocr_ctx, "active", False):
+        return
+    strong, _ = _extract_all(txt)
+    for candidate in strong:
+        _ocr_ctx.counts[candidate] = _ocr_ctx.counts.get(candidate, 0) + 1
+        _ocr_ctx.sources.setdefault(candidate, set()).add(_ocr_ctx.stage)
+
+
 def _ocr_pass_texts(image, target_width: int, extended: bool) -> str:
     """前処理した画像に複数のモードでOCRをかけ、結果をまとめて返す。
 
     1モードでも読めれば番号を拾えるようにするための束ね読み。
     extended=True では、大津二値化と psm 11 の数字ホワイトリストも加える。
+    各呼び出しにはタイムアウトを付け、OCR全体の締切を過ぎたら
+    残りのモードは試さない。
     """
     import pytesseract
 
@@ -1540,10 +1588,23 @@ def _ocr_pass_texts(image, target_width: int, extended: bool) -> str:
         ]
     texts: list[str] = []
     for img, config in passes:
+        deadline = getattr(_ocr_ctx, "deadline", None)
+        if deadline is not None and time.monotonic() > deadline:
+            break
         try:
-            texts.append(pytesseract.image_to_string(img, lang="eng", config=config))
+            txt = pytesseract.image_to_string(
+                img, lang="eng", config=config, timeout=OCR_CALL_TIMEOUT
+            )
+        except TypeError:
+            # timeout 引数に未対応の古い pytesseract では付けずに読み直す
+            try:
+                txt = pytesseract.image_to_string(img, lang="eng", config=config)
+            except Exception:
+                continue
         except Exception:
             continue
+        texts.append(txt)
+        _record_ocr_text(txt)
     return "\n".join(texts)
 
 
@@ -1552,9 +1613,13 @@ def ocr_image(data: bytes) -> str:
 
     前処理した画像を複数のモードで読み、結果をまとめて返す。
     1モードでも読めれば番号を拾えるようにするため。
-    通常の読み取りで候補が見つからない場合は、追加パスと回転も試す
-    （逆さま・横向きに撮られた写真への対応。見つかった時点で打ち切る）。
+    通常の読み取りで候補が見つからない場合は、追加パスと回転・反転も
+    試す。あわせて、候補ごとの一致回数と「通常パスで出たか」を
+    _last_ocr_detail に残す（呼び出し側の信頼度判定用）。
+    OCR全体には締切（OCR_DEADLINE_SECONDS）があり、過ぎたら
+    その時点までの結果を返す。
     """
+    global _last_ocr_detail
     try:
         import pytesseract
         from PIL import Image, ImageOps
@@ -1568,6 +1633,15 @@ def ocr_image(data: bytes) -> str:
         default_exe = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
         if default_exe.exists():
             pytesseract.pytesseract.tesseract_cmd = str(default_exe)
+        else:
+            # 本体が無いまま全パスを空振りして「読み取れませんでした」に
+            # なる前に、最初に1回だけ確認して案内を出す
+            raise RuntimeError(
+                "Tesseract 本体が見つかりません。"
+                "Tesseract 本体のインストールが必要です"
+                "（Windows: UB Mannheim 版インストーラ / Mac: brew install tesseract / "
+                "Linux: apt install tesseract-ocr）。"
+            )
     # 展開すると巨大になる画像（解凍爆弾）への対策:
     # Pillow の上限も絞ったうえで、読み込む前に画素数を自分でも確認する
     Image.MAX_IMAGE_PIXELS = 25_000_000
@@ -1580,40 +1654,74 @@ def ocr_image(data: bytes) -> str:
         return ""
     # スマホ写真の EXIF 回転情報を反映する（横向きのまま読まないように）
     image = ImageOps.exif_transpose(opened)
-    text = _ocr_pass_texts(image, 1200, extended=False)
-    if extract_tracking_numbers(text):
-        # 候補が見つかっても、写真が斜め・逆光などで数字が化けていると
-        # 誤読の候補だけが残ることがある。同じ向きの追加パスと、
-        # 実績のある2方向（180度と時計回り90度）の追加読み取りも
-        # 混ぜて返し、呼び出し側の日本郵便の履歴照合で正しい候補を
-        # 選べるようにする。
-        text += "\n" + _ocr_pass_texts(image, 2400, extended=True)
-        for angle in (180, -90):
+    # 回転・反転は元解像度のコピーを作るため、先に最大2000pxへ縮小して
+    # おく（この後の前処理でも結局2000pxへ縮められる寸法に揃える。
+    # メモリのピークと回転にかかる時間を抑えるため）
+    if image.width > 2000 or image.height > 2000:
+        scale = 2000 / max(image.width, image.height)
+        image = image.resize(
+            (max(1, round(image.width * scale)),
+             max(1, round(image.height * scale))),
+            Image.LANCZOS,
+        )
+
+    _ocr_ctx.active = True
+    _ocr_ctx.counts = {}
+    _ocr_ctx.sources = {}
+    _ocr_ctx.stage = "initial"
+    _ocr_ctx.deadline = time.monotonic() + OCR_DEADLINE_SECONDS
+
+    def run(img, target_width: int, extended: bool, stage: str) -> str:
+        if time.monotonic() > _ocr_ctx.deadline:
+            return ""
+        _ocr_ctx.stage = stage
+        return _ocr_pass_texts(img, target_width, extended)
+
+    try:
+        text = run(image, 1200, False, "initial")
+        if extract_tracking_numbers(text):
+            # 候補が見つかっても、写真が斜め・逆光などで数字が化けていると
+            # 誤読の候補だけが残ることがある。同じ向きの追加パスと、
+            # 実績のある2方向（180度と時計回り90度）の追加読み取りも
+            # 混ぜて返し、呼び出し側の日本郵便の履歴照合で正しい候補を
+            # 選べるようにする。
+            text += "\n" + run(image, 2400, True, "extra")
+            for angle in (180, -90):
+                rotated = image.rotate(angle, expand=True)
+                text += "\n" + run(rotated, 2400, True, "extra")
+            return text
+        # 通常の読み取りで候補が見つからなかった場合は、全方向の追加
+        # 読み取りを混ぜて返す。途中で誤読候補が出ても打ち切らない
+        # （誤読の陰で正解が埋もれ、正解側の読み取りに届かなくなるため。
+        # 正しい候補は呼び出し側の履歴照合と利用者の目で選ばれる）。
+        # EXIF に回転情報が無い（共有・転送で消えた）写真でも拾えるように。
+        text += "\n" + run(image, 2400, True, "extra")
+        for angle in (180, -90, 90):
             rotated = image.rotate(angle, expand=True)
-            text += "\n" + _ocr_pass_texts(rotated, 2400, extended=True)
+            text += "\n" + run(rotated, 2400, True, "extra")
+        # 写真によっては読み取りが境界線上にあり、同じ条件でも読めたり
+        # 読めなかったりする。前処理の違う通常パスでもう一度回転読み取りを
+        # して、拾える確率を上げる。
+        for angle in (180, -90, 90):
+            rotated = image.rotate(angle, expand=True)
+            text += "\n" + run(rotated, 1200, False, "extra")
+        # 鏡越し・反転保存された写真への対応（左右反転して読み直す）
+        mirrored = ImageOps.mirror(image)
+        text += "\n" + run(mirrored, 2400, True, "extra")
+        for angle in (180, -90, 90):
+            rotated = mirrored.rotate(angle, expand=True)
+            text += "\n" + run(rotated, 2400, True, "extra")
         return text
-    # 通常の読み取りで候補が見つからなかった場合は、全方向の追加
-    # 読み取りを混ぜて返す。途中で誤読候補が出ても打ち切らない
-    # （誤読の陰で正解が埋もれ、正解側の読み取りに届かなくなるため。
-    # 正しい候補は呼び出し側の履歴照合と利用者の目で選ばれる）。
-    # EXIF に回転情報が無い（共有・転送で消えた）写真でも拾えるように。
-    text += "\n" + _ocr_pass_texts(image, 2400, extended=True)
-    for angle in (180, -90, 90):
-        rotated = image.rotate(angle, expand=True)
-        text += "\n" + _ocr_pass_texts(rotated, 2400, extended=True)
-    # 写真によっては読み取りが境界線上にあり、同じ条件でも読めたり
-    # 読めなかったりする。前処理の違う通常パスでもう一度回転読み取りを
-    # して、拾える確率を上げる。
-    for angle in (180, -90, 90):
-        rotated = image.rotate(angle, expand=True)
-        text += "\n" + _ocr_pass_texts(rotated, 1200, extended=False)
-    # 鏡越し・反転保存された写真への対応（左右反転して読み直す）
-    mirrored = ImageOps.mirror(image)
-    text += "\n" + _ocr_pass_texts(mirrored, 2400, extended=True)
-    for angle in (180, -90, 90):
-        rotated = mirrored.rotate(angle, expand=True)
-        text += "\n" + _ocr_pass_texts(rotated, 2400, extended=True)
-    return text
+    finally:
+        _last_ocr_detail = {
+            "counts": dict(_ocr_ctx.counts),
+            "initial": {
+                c for c, stages in _ocr_ctx.sources.items()
+                if "initial" in stages
+            },
+        }
+        _ocr_ctx.active = False
+        _ocr_ctx.deadline = None
 
 
 @tree.command(name="history", description="自分の配達済み履歴を確認")
@@ -1704,9 +1812,16 @@ async def scan_command(
         )
         return
     await interaction.response.defer(ephemeral=True)
+    # OCRは重く、クールダウン（30秒）より長くかかることがあるため、
+    # 同時に1件だけ実行する（Tesseractの並列実行を防ぐ）。
+    # 信頼度の集計（_last_ocr_detail）もこの区間の中で受け取る。
+    global _last_ocr_detail
     try:
-        data = await image.read()
-        text = await asyncio.to_thread(ocr_image, data)
+        async with _scan_semaphore:
+            _last_ocr_detail = None
+            data = await image.read()
+            text = await asyncio.to_thread(ocr_image, data)
+            ocr_detail = _last_ocr_detail
     except RuntimeError as e:
         await interaction.followup.send(str(e), ephemeral=True)
         return
@@ -1720,6 +1835,32 @@ async def scan_command(
         return
 
     candidates, weak = _extract_all(text)
+    if ocr_detail is not None:
+        # 候補ごとに信頼度を付ける: 通常パスで出た候補か、2回以上の
+        # 読み取りで一致した候補だけを「信頼できる候補」とする。
+        # 一致回数の多い順に並べ替え、正解が照会上限の外へ
+        # 押し出されにくくする。
+        counts = ocr_detail.get("counts", {})
+        initial = ocr_detail.get("initial", set())
+        order = {c: i for i, c in enumerate(candidates)}
+        # 一致回数で並べる。通常パスで出た候補は +1 ぶん重みを付ける
+        candidates.sort(
+            key=lambda c: (
+                -(counts.get(c, 0) + (1 if c in initial else 0)), order[c]
+            )
+        )
+        trusted = {
+            c for c in candidates
+            if counts.get(c, 0) >= 2 or c in initial
+        }
+    else:
+        # ocr_image が差し替えられている場合など、集計が無いときは
+        # 従来どおり全候補を信頼できるものとして扱う
+        trusted = set(candidates)
+
+    def pending_of(numbers: list[str]) -> list[str]:
+        """保留プールへ入れてよい候補だけを返す（信頼できる候補のみ）。"""
+        return [n for n in numbers if n in trusted]
     # 候補が大量に写っていても、扱うのは上限まで（照会・保留・ボタンの負荷対策）
     candidates = candidates[:MAX_SCAN_CANDIDATES]
     weak = weak[:MAX_SCAN_CANDIDATES]
@@ -1740,45 +1881,67 @@ async def scan_command(
                 errors += 1
         if not verified:
             if errors == len(checked):
-                add_pending_candidates(
-                    interaction, checked + extras, memo.strip(),
-                    checked_now=False,
-                )
-                await interaction.followup.send(
-                    "日本郵便への照会でエラーが発生しました。"
-                    "候補は保留したので、接続できるようになったら自動で確認します。",
-                    ephemeral=True,
-                )
+                kept = pending_of(checked + extras)
+                if kept:
+                    add_pending_candidates(
+                        interaction, kept, memo.strip(), checked_now=False,
+                    )
+                    msg = (
+                        "日本郵便への照会でエラーが発生しました。"
+                        "候補は保留したので、接続できるようになったら自動で確認します。"
+                    )
+                else:
+                    msg = (
+                        "日本郵便への照会でエラーが発生しました。"
+                        "読み取りの一致が弱い候補しか無かったため、保留はしませんでした。"
+                        "時間をおいて試すか、/track で手入力してください。"
+                    )
+                await interaction.followup.send(msg, ephemeral=True)
                 return
             listed = " / ".join(f"`{c}`" for c in checked)
-            add_pending_candidates(
-                interaction, checked, memo.strip(), checked_now=True
-            )
-            if extras:
+            kept_checked = pending_of(checked)
+            if kept_checked:
                 add_pending_candidates(
-                    interaction, extras, memo.strip(), checked_now=False
+                    interaction, kept_checked, memo.strip(), checked_now=True
                 )
+            if extras:
+                kept_extras = pending_of(extras)
+                if kept_extras:
+                    add_pending_candidates(
+                        interaction, kept_extras, memo.strip(),
+                        checked_now=False,
+                    )
+            if kept_checked:
+                tail = "このままにしても、履歴が出たら自動で登録します（最長2日間、時々確認します）。"
+            else:
+                tail = "読み取りの一致が弱い候補のため、自動の後追い確認はしません。"
             await interaction.followup.send(
                 f"番号らしきものが見つかりました: {listed}\n"
                 "ただし日本郵便に履歴が確認できなかったため、自動登録はしませんでした。\n"
                 "本物の荷物なら、下のボタンでそのまま登録できます。\n"
-                "このままにしても、履歴が出たら自動で登録します（最長2日間、時々確認します）。",
+                f"{tail}",
                 view=ScanRegisterView(checked, interaction.user.id, memo.strip()),
                 ephemeral=True,
             )
             return
         unverified = [c for c in checked if c not in verified]
         if unverified:
-            # 照会したが履歴が無かった候補も捨てず、保留で後追い確認する
+            # 照会したが履歴が無かった候補のうち、信頼できるものは
+            # 捨てず、保留で後追い確認する
             # （写真に複数の伝票が写っていた場合の2件目など）
-            add_pending_candidates(
-                interaction, unverified, memo.strip(), checked_now=True
-            )
+            kept_unverified = pending_of(unverified)
+            if kept_unverified:
+                add_pending_candidates(
+                    interaction, kept_unverified, memo.strip(), checked_now=True
+                )
         if extras:
-            # 照会上限（5件）から漏れた候補も捨てず、保留で後追い確認する
-            add_pending_candidates(
-                interaction, extras, memo.strip(), checked_now=False
-            )
+            # 照会上限（5件）から漏れた候補も同様に、信頼できるものだけ
+            # 保留で後追い確認する
+            kept_extras = pending_of(extras)
+            if kept_extras:
+                add_pending_candidates(
+                    interaction, kept_extras, memo.strip(), checked_now=False
+                )
         candidates = verified
     if not candidates:
         if weak:
