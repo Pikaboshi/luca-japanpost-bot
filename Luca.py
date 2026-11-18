@@ -1,6 +1,15 @@
 """
 日本郵便 追跡 -> Discord通知 Bot「Luca」 v4（複数件・複数人対応）
 
+v4.24 の変更点（実地テスト: 反転した写真への対応）:
+  - /scan の OCR で、通常の読み取りで候補が見つからない場合に、
+    左右反転した画像での読み取りも試すようにした
+    （鏡越し・反転保存された写真でも番号を拾えるように）
+  - 候補なしの場合の追加読み取りは、途中で候補が出ても打ち切らず
+    全方向を混ぜて返すようにした（誤読候補の陰で正解が埋もれないように）
+  - 境界線上の写真でも拾えるよう、回転読み取りは前処理の違う
+    通常パスでも試すようにした
+
 v4.23 の変更点（実地テスト: 回転した写真で読めない問題への対応）:
   - /scan の OCR に追加読み取りを入れた。追加パス（大津二値化・
     psm 11 の数字ホワイトリスト、拡大幅2400px）と、画像を180度・
@@ -1583,18 +1592,27 @@ def ocr_image(data: bytes) -> str:
             rotated = image.rotate(angle, expand=True)
             text += "\n" + _ocr_pass_texts(rotated, 2400, extended=True)
         return text
-    # 通常の読み取りで候補が見つからなかった場合の追加読み取り。
-    # まず同じ向きのまま追加パス（大津二値化・psm 11・拡大幅2400px）を、
-    # それでも駄目なら180度・±90度に回した読み取りを試す。
+    # 通常の読み取りで候補が見つからなかった場合は、全方向の追加
+    # 読み取りを混ぜて返す。途中で誤読候補が出ても打ち切らない
+    # （誤読の陰で正解が埋もれ、正解側の読み取りに届かなくなるため。
+    # 正しい候補は呼び出し側の履歴照合と利用者の目で選ばれる）。
     # EXIF に回転情報が無い（共有・転送で消えた）写真でも拾えるように。
     text += "\n" + _ocr_pass_texts(image, 2400, extended=True)
-    if extract_tracking_numbers(text):
-        return text
     for angle in (180, -90, 90):
         rotated = image.rotate(angle, expand=True)
         text += "\n" + _ocr_pass_texts(rotated, 2400, extended=True)
-        if extract_tracking_numbers(text):
-            break
+    # 写真によっては読み取りが境界線上にあり、同じ条件でも読めたり
+    # 読めなかったりする。前処理の違う通常パスでもう一度回転読み取りを
+    # して、拾える確率を上げる。
+    for angle in (180, -90, 90):
+        rotated = image.rotate(angle, expand=True)
+        text += "\n" + _ocr_pass_texts(rotated, 1200, extended=False)
+    # 鏡越し・反転保存された写真への対応（左右反転して読み直す）
+    mirrored = ImageOps.mirror(image)
+    text += "\n" + _ocr_pass_texts(mirrored, 2400, extended=True)
+    for angle in (180, -90, 90):
+        rotated = mirrored.rotate(angle, expand=True)
+        text += "\n" + _ocr_pass_texts(rotated, 2400, extended=True)
     return text
 
 
